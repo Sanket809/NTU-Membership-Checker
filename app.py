@@ -52,18 +52,182 @@ def process_data(members_file, payments_file, external_file):
 
 def reconcile_memberships(members_df, payments_df):
     """Reconcile membership payments with selected players"""
-    # [The entire reconcile_memberships function from your original code goes here]
-    # Copy the EXACT function from your original membership_checker.py
+    # Get selected players
+    selected_players = members_df[members_df['IsSelectedOfficialTeam'] == 'Yes'].copy()
+    
+    # Initialize result columns
+    selected_players['PaidAmount'] = 0.0
+    selected_players['PaidStatus'] = 'Unpaid'
+    selected_players['Outstanding'] = ANNUAL_FEE
+    selected_players['PaymentDate'] = None
+    
+    # Track matched payments
+    matched_payment_indices = set()
+    fuzzy_suggestions = []
+    resolved_payments = []
+    
+    # First pass: match by StudentID
+    for idx, payment in payments_df.iterrows():
+        resolved_payment = payment.to_dict()
+        resolved_payment['ResolvedStudentID'] = None
+        resolved_payment['MatchType'] = 'Unmatched'
+        
+        if not pd.isna(payment.get('StudentID')):
+            student_id = payment['StudentID']
+            match = selected_players[selected_players['StudentID'] == student_id]
+            if not match.empty:
+                matched_idx = match.index[0]
+                selected_players.at[matched_idx, 'PaidAmount'] += payment['Amount']
+                selected_players.at[matched_idx, 'Outstanding'] = max(0, ANNUAL_FEE - selected_players.at[matched_idx, 'PaidAmount'])
+                selected_players.at[matched_idx, 'PaymentDate'] = payment['PaymentDate']
+                matched_payment_indices.add(idx)
+                resolved_payment['ResolvedStudentID'] = selected_players.at[matched_idx, 'StudentID']
+                resolved_payment['MatchType'] = 'StudentID'
+        
+        resolved_payments.append(resolved_payment)
+    
+    # Second pass: fuzzy match by name for unmatched payments
+    all_selected_names = selected_players['NormalizedName'].tolist()
+    
+    for idx, payment in payments_df.iterrows():
+        if idx in matched_payment_indices:
+            continue
+            
+        normalized_payment_name = normalize_name(payment['FullName'])
+        if not normalized_payment_name:
+            continue
+            
+        # Fuzzy match
+        matches = difflib.get_close_matches(
+            normalized_payment_name, 
+            all_selected_names, 
+            n=1, 
+            cutoff=FUZZY_CUTOFF
+        )
+        
+        if matches:
+            matched_name = matches[0]
+            match = selected_players[selected_players['NormalizedName'] == matched_name]
+            if not match.empty:
+                matched_idx = match.index[0]
+                selected_players.at[matched_idx, 'PaidAmount'] += payment['Amount']
+                selected_players.at[matched_idx, 'Outstanding'] = max(0, ANNUAL_FEE - selected_players.at[matched_idx, 'PaidAmount'])
+                selected_players.at[matched_idx, 'PaymentDate'] = payment['PaymentDate']
+                matched_payment_indices.add(idx)
+                
+                # Update resolved payment
+                for rp in resolved_payments:
+                    if rp['NormalizedName'] == normalized_payment_name and rp['MatchType'] == 'Unmatched':
+                        rp['ResolvedStudentID'] = selected_players.at[matched_idx, 'StudentID']
+                        rp['MatchType'] = 'FuzzyName'
+                
+                # Add to suggestions
+                if normalized_payment_name != matched_name:
+                    fuzzy_suggestions.append({
+                        'EnteredName': payment['FullName'],
+                        'SuggestedName': selected_players.at[matched_idx, 'FullName']
+                    })
+    
+    # Update payment status
+    for idx, player in selected_players.iterrows():
+        if player['PaidAmount'] >= ANNUAL_FEE:
+            selected_players.at[idx, 'PaidStatus'] = 'Paid'
+        elif player['PaidAmount'] > 0:
+            selected_players.at[idx, 'PaidStatus'] = 'Underpaid'
+        else:
+            selected_players.at[idx, 'PaidStatus'] = 'Unpaid'
+    
+    # Find payments from non-selected players
+    all_member_ids = set(members_df['StudentID'])
+    paid_not_selected = []
+    
+    for idx, payment in payments_df.iterrows():
+        if idx in matched_payment_indices:
+            continue
+            
+        # Check if this payment is from any member (selected or not)
+        payment_matched = False
+        if not pd.isna(payment.get('StudentID')):
+            if payment['StudentID'] in all_member_ids:
+                payment_matched = True
+        
+        if not payment_matched and not pd.isna(payment.get('FullName')):
+            payment_name = normalize_name(payment['FullName'])
+            if payment_name in members_df['NormalizedName'].values:
+                payment_matched = True
+        
+        if not payment_matched:
+            paid_not_selected.append(payment.to_dict())
+    
+    # Find completely unmatched payments
+    unmatched_payments = []
+    for rp in resolved_payments:
+        if rp['MatchType'] == 'Unmatched':
+            unmatched_payments.append(rp)
+    
+    return selected_players, fuzzy_suggestions, paid_not_selected, unmatched_payments, resolved_payments
 
 def validate_external_bookings(external_df):
     """Validate external bookings against hourly rate"""
-    # [The entire validate_external_bookings function from your original code goes here]
-    # Copy the EXACT function from your original membership_checker.py
+    external_df = external_df.copy()
+    external_df['Expected'] = external_df['Hours'] * HOURLY_RATE
+    external_df['Underpaid'] = external_df['AmountPaid'] < external_df['Expected'] - 0.01
+    external_df['MissingPayment'] = external_df['AmountPaid'] <= 0
+    
+    # Identify problematic bookings
+    external_issues = external_df[
+        (external_df['Underpaid']) | 
+        (external_df['MissingPayment'])
+    ].copy()
+    
+    return external_df, external_issues
 
 def generate_summary(selected_players, paid_not_selected, unmatched_payments, external_df, external_issues):
     """Generate summary statistics"""
-    # [The entire generate_summary function from your original code goes here]
-    # Copy the EXACT function from your original membership_checker.py
+    total_selected = len(selected_players)
+    paid_count = len(selected_players[selected_players['PaidStatus'] == 'Paid'])
+    underpaid_count = len(selected_players[selected_players['PaidStatus'] == 'Underpaid'])
+    unpaid_count = len(selected_players[selected_players['PaidStatus'] == 'Unpaid'])
+    
+    mismatch_rate = (underpaid_count + unpaid_count) / total_selected * 100 if total_selected > 0 else 0
+    
+    membership_expected = total_selected * ANNUAL_FEE
+    membership_collected = selected_players['PaidAmount'].sum()
+    
+    external_expected = external_df['Expected'].sum()
+    external_collected = external_df['AmountPaid'].sum()
+    external_issues_count = len(external_issues)
+    
+    non_selected_payments_count = len(paid_not_selected)
+    unmatched_payments_count = len(unmatched_payments)
+    
+    summary = f"""NTU Sports - Membership & Bookings Reconciliation
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+MEMBERSHIP SUMMARY:
+Total selected members: {total_selected}
+- Paid in full: {paid_count}
+- Underpaid: {underpaid_count}
+- Unpaid: {unpaid_count}
+Mismatch rate: {mismatch_rate:.1f}%
+
+Membership revenue:
+- Expected: £{membership_expected:,.2f}
+- Collected: £{membership_collected:,.2f}
+- Difference: £{membership_collected - membership_expected:,.2f}
+
+EXTERNAL BOOKINGS:
+Total bookings: {len(external_df)}
+- Expected: £{external_expected:,.2f}
+- Collected: £{external_collected:,.2f}
+- Difference: £{external_collected - external_expected:,.2f}
+- Bookings with issues: {external_issues_count}
+
+ADDITIONAL FINDINGS:
+- Payments from non-selected players: {non_selected_payments_count}
+- Unmatched payments (need review): {unmatched_payments_count}
+"""
+    return summary
 
 # File upload section
 st.header("📤 Step 1: Upload Your CSV Files")
@@ -87,11 +251,13 @@ if st.button("🚀 Run Reconciliation", type="primary", use_container_width=True
                 st.error(error)
             else:
                 # Run reconciliation
-                selected_players, fuzzy_suggestions, paid_not_selected, unmatched_payments, resolved_payments = reconcile_memberships(members_df, payments_df)
+                selected_players, fuzzy_suggestions, paid_not_selected, unmatched_payments, resolved_payments = reconcile_memberships(
+                    members_df, payments_df)
                 external_df, external_issues = validate_external_bookings(external_df)
                 
                 # Generate summary
-                summary = generate_summary(selected_players, paid_not_selected, unmatched_payments, external_df, external_issues)
+                summary = generate_summary(
+                    selected_players, paid_not_selected, unmatched_payments, external_df, external_issues)
                 
                 # Store results in session state
                 st.session_state.selected_players = selected_players
@@ -190,9 +356,9 @@ if st.session_state.results_generated:
 with st.expander("🧪 Don't have data? Use our sample files"):
     st.markdown("""
     Download these sample files to test the tool:
-    - [Sample Members CSV](path/to/sample_members.csv)
-    - [Sample Payments CSV](path/to/sample_payments.csv)
-    - [Sample External Bookings CSV](path/to/sample_external.csv)
+    - [Sample Members CSV](https://github.com/your-username/NTU-Membership-Checker/raw/main/members.csv)
+    - [Sample Payments CSV](https://github.com/your-username/NTU-Membership-Checker/raw/main/membership_payments.csv)
+    - [Sample External Bookings CSV](https://github.com/your-username/NTU-Membership-Checker/raw/main/external_bookings.csv)
     """)
 
 # Footer
